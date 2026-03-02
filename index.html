@@ -911,6 +911,33 @@ nav{position:fixed;bottom:0;left:0;right:0;height:var(--nav-h);background:var(--
 </div>
 </div>
 
+
+
+<!-- ADD TO RADAR SHEET -->
+<div id="sheet-radar-add" class="sheet-ov" onclick="closeOv(event)">
+<div class="sheet">
+  <div class="shandle"></div>
+  <div class="stitle">Add to Radar</div>
+  <div class="blk blk-amb" style="margin-bottom:14px">
+    <div class="blk-txt">Enter NSE ticker. The app fetches live price, RSI, 200DMA and generates an entry verdict automatically using v3.2 rules.</div>
+  </div>
+  <div class="fg"><label class="fl">NSE TICKER</label><input type="text" id="ra-ticker" class="fi" placeholder="e.g. HDFCBANK, HAL, ZOMATO" autocapitalize="characters"></div>
+  <div class="fg"><label class="fl">SECTOR</label><select id="ra-sector" class="fs">
+    <option value="Financials">Financials</option>
+    <option value="Technology">Technology</option>
+    <option value="Consumer">Consumer</option>
+    <option value="Industrials">Industrials</option>
+    <option value="Healthcare">Healthcare</option>
+    <option value="Infrastructure">Infrastructure</option>
+    <option value="Energy">Energy</option>
+    <option value="Telecom">Telecom</option>
+  </select></div>
+  <div class="fg"><label class="fl">YOUR NOTES (optional)</label><input type="text" id="ra-notes" class="fi" placeholder="e.g. watching for pullback to 50DMA"></div>
+  <button class="btn-p" onclick="addToRadar()">Add &amp; Analyse</button>
+  <button class="btn-s" onclick="closeSheet('sheet-radar-add')">Cancel</button>
+</div>
+</div>
+
 <script>
 // ═══════════════════════════════════════════════════════════════
 // QUANT LAB v3.2 — FULL SYSTEM ENGINE
@@ -1001,47 +1028,79 @@ function pvol14(arr){
   return Math.sqrt(rets.reduce((a,b)=>a+(b-m)**2,0)/rets.length*252)*100;
 }
 
-// ── FETCH ────────────────────────────────────────────────────────
-const PX=['https://corsproxy.io/?url=','https://api.allorigins.win/raw?url='];
-// Fetch closes only (used for Nifty/VIX market data)
-async function yf(sym,range='6mo',px=0){
-  const url=`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=${range}`;
+// ── FETCH ENGINE — 6 proxy fallbacks + localStorage cache ────────
+// Reason for complexity: public CORS proxies are unreliable individually.
+// We try each one in sequence; first to succeed wins. Last-resort: stale cache.
+const PROXIES = [
+  u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://proxy.cors.sh/${u}`,
+  u => `https://thingproxy.freeboard.io/fetch/${u}`,
+  u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
+];
+
+function cacheSet(k,d){try{localStorage.setItem('yfc_'+k,JSON.stringify({t:Date.now(),d}));}catch(e){}}
+function cacheGet(k,maxMs=14400000){
   try{
-    const r=await fetch(PX[px]+encodeURIComponent(url),{signal:AbortSignal.timeout(9000)});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const j=await r.json();
-    const ch=j.chart?.result?.[0];
-    if(!ch)throw new Error('no data');
-    return ch.indicators.quote[0].close.filter(x=>x!=null);
-  }catch(e){
-    if(px<PX.length-1)return yf(sym,range,px+1);
-    throw e;
-  }
+    const r=localStorage.getItem('yfc_'+k);
+    if(!r)return null;
+    const {t,d}=JSON.parse(r);
+    return (Date.now()-t<maxMs)?d:null;
+  }catch(e){return null;}
 }
 
-// Fetch full OHLCV — used for stocks so we can compute real ATR
-async function yfOHLC(sym,range='6mo',px=0){
-  const url=`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=${range}`;
-  try{
-    const r=await fetch(PX[px]+encodeURIComponent(url),{signal:AbortSignal.timeout(10000)});
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const j=await r.json();
-    const ch=j.chart?.result?.[0];
-    if(!ch)throw new Error('no data');
-    const q=ch.indicators.quote[0];
-    // Filter out null rows (keep indices where close is valid)
-    const closes=[],highs=[],lows=[],vols=[];
-    for(let i=0;i<q.close.length;i++){
-      if(q.close[i]!=null&&q.high[i]!=null&&q.low[i]!=null){
-        closes.push(q.close[i]);highs.push(q.high[i]);lows.push(q.low[i]);
-        vols.push(q.volume?.[i]||0);
-      }
-    }
-    return{closes,highs,lows,vols};
-  }catch(e){
-    if(px<PX.length-1)return yfOHLC(sym,range,px+1);
-    throw e;
+async function fetchYahoo(yahooUrl, cacheKey){
+  // Return fresh cache if available (< 4 hours old)
+  const fresh=cacheGet(cacheKey,14400000);
+  if(fresh)return{raw:fresh,fromCache:true};
+  // Try each proxy in order
+  for(let i=0;i<PROXIES.length;i++){
+    try{
+      // Use Promise.race for timeout — AbortSignal.timeout() not on older Android
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),10000);
+      const r=await fetch(PROXIES[i](yahooUrl),{
+        signal:controller.signal,
+        headers:{'Accept':'application/json'}
+      });
+      clearTimeout(timer);
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      let j=await r.json();
+      // allorigins /get wraps response in {contents:"..."}
+      if(typeof j.contents==='string') j=JSON.parse(j.contents);
+      const ch=j.chart?.result?.[0];
+      if(!ch)throw new Error('no chart data');
+      const raw={q:ch.indicators.quote[0]};
+      cacheSet(cacheKey,raw);
+      return{raw,fromCache:false};
+    }catch(e){ /* try next proxy */ }
   }
+  // All proxies failed — try stale cache (up to 7 days old)
+  const stale=cacheGet(cacheKey,604800000);
+  if(stale)return{raw:stale,fromCache:true,stale:true};
+  throw new Error('All proxies failed — no cached data available');
+}
+
+// Closes only — for Nifty/VIX
+async function yf(sym,range='6mo'){
+  const url=`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=${range}`;
+  const {raw}=await fetchYahoo(url,sym+'_'+range);
+  return raw.q.close.filter(x=>x!=null);
+}
+
+// Full OHLCV — for individual stocks (ATR needs highs/lows)
+async function yfOHLC(sym,range='6mo'){
+  const url=`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=${range}`;
+  const {raw,stale}=await fetchYahoo(url,sym+'_ohlc_'+range);
+  const q=raw.q, closes=[],highs=[],lows=[],vols=[];
+  for(let i=0;i<q.close.length;i++){
+    if(q.close[i]!=null&&q.high[i]!=null&&q.low[i]!=null){
+      closes.push(q.close[i]);highs.push(q.high[i]);lows.push(q.low[i]);
+      vols.push(q.volume?.[i]||0);
+    }
+  }
+  return{closes,highs,lows,vols,stale:stale||false};
 }
 
 // True ATR(14) using High/Low/Close — the real formula
@@ -1065,8 +1124,10 @@ async function fetchMarket(){
   // Fail fast if no connectivity — 12 second hard timeout
   const fetchTimeout = setTimeout(()=>{
     setReb('⟳ Retry');
+    // Show saved regime from last session — don't stay on LOADING
+    updateDashboard();
     updateCondCards();
-    addAlert({type:'warning',title:'⚠ Data Fetch Timeout',body:'Cannot reach market data servers. Check your internet connection and tap Refresh.'});
+    addAlert({type:'warning',title:'⚠ Fetch Timeout — Showing Cached Data',body:'Live market data unavailable. Tap Refresh to retry. Your portfolio data is still accessible.'});
     renderAlerts();
   }, 12000);
   try{
@@ -1086,8 +1147,7 @@ async function fetchMarket(){
     fireGlobalAlerts(crash,old,vx,vxc,r5);
     clearTimeout(fetchTimeout);
     save();updateDashboard();setReb('⟳ Refresh');
-  }catch(e){clearTimeout(fetchTimeout);setReb('⟳ Retry');addAlert({type:'warning',title:'⚠ Data Fetch Failed',body:'Cannot reach Yahoo Finance. Check internet connection and tap Refresh.'});renderAlerts();}
-}
+  }catch(e){clearTimeout(fetchTimeout);setReb('⟳ Retry');updateDashboard();addAlert({type:'warning',title:'⚠ Market Data Failed',body:'Live data unavailable — showing last saved regime. Tap Refresh to retry.'});renderAlerts();}
 }
 
 async function fetchAllPrices(){
@@ -1395,33 +1455,33 @@ function renderPositions(){
     const t1Action = type==='sme' ? 'TIGHTEN STOP' : 'BOOK 25%';
     const t2Action = type==='sme' ? 'TIGHTEN AGAIN' : 'BOOK 25%';
 
-    return \`
-    <div class="\${cls}">
+    return `
+    <div class="${cls}">
       <!-- HEADER -->
       <div class="phead">
         <div>
-          <div class="pticker">\${ticker}</div>
-          <div class="psectag">\${sector} · \${Math.round(wk)}w held · \${posPct.toFixed(1)}% of portfolio</div>
+          <div class="pticker">${ticker}</div>
+          <div class="psectag">${sector} · ${Math.round(wk)}w held · ${posPct.toFixed(1)}% of portfolio</div>
         </div>
         <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-          <span class="ptype \${type==='sme'?'t-sme':'t-lc'}">\${type==='sme'?'SME LOT':'LARGE CAP'}</span>
-          \${!cur?'<span class="fet-tag">FETCHING PRICE</span>':\`<span style="font-size:9px;color:var(--text3);font-family:var(--mono)">\${lastT} IST</span>\`}
+          <span class="ptype ${type==='sme'?'t-sme':'t-lc'}">${type==='sme'?'SME LOT':'LARGE CAP'}</span>
+          ${!cur?'<span class="fet-tag">FETCHING PRICE</span>':`<span style="font-size:9px;color:var(--text3);font-family:var(--mono)">${lastT} IST</span>`}
         </div>
       </div>
 
-      \${chips.length?\`<div class="chips">\${chips.join('')}</div>\`:''}
+      ${chips.length?`<div class="chips">${chips.join('')}</div>`:''}
 
       <!-- PRICE & P&L ROW -->
       <div class="pprow">
         <div>
           <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:2px">CURRENT PRICE</div>
-          <div class="pcp">\${cur?'₹'+f2(cur):'₹–'}</div>
-          <div style="font-size:10px;color:var(--text2);margin-top:2px">Entry ₹\${f2(entry)} · Qty \${qty}</div>
+          <div class="pcp">${cur?'₹'+f2(cur):'₹–'}</div>
+          <div style="font-size:10px;color:var(--text2);margin-top:2px">Entry ₹${f2(entry)} · Qty ${qty}</div>
         </div>
         <div class="ppnl" style="text-align:right">
-          <div class="ppnlp \${pnlP>=0?'up':pnlP<0?'dn':''}">\${cur?fp(pnlP):'–'}</div>
-          <div class="ppnli">\${cur?inr(pnlI):''}</div>
-          <div style="font-size:10px;color:var(--text3);margin-top:2px">\${cur?inr(curVal)+' value':''}</div>
+          <div class="ppnlp ${pnlP>=0?'up':pnlP<0?'dn':''}">${cur?fp(pnlP):'–'}</div>
+          <div class="ppnli">${cur?inr(pnlI):''}</div>
+          <div style="font-size:10px;color:var(--text3);margin-top:2px">${cur?inr(curVal)+' value':''}</div>
         </div>
       </div>
 
@@ -1432,21 +1492,21 @@ function renderPositions(){
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
           <div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:3px">STOP PRICE</div>
-            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--red)">\${stop?'₹'+f2(stop):'Auto'}</div>
-            <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-top:2px">\${type==='sme'?'2.5× ATR':'2× ATR'}</div>
+            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--red)">${stop?'₹'+f2(stop):'Auto'}</div>
+            <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-top:2px">${type==='sme'?'2.5× ATR':'2× ATR'}</div>
           </div>
           <div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:3px">RISK %</div>
-            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--amber)">\${stopPct?'-'+stopPct.toFixed(2)+'%':'–'}</div>
+            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--amber)">${stopPct?'-'+stopPct.toFixed(2)+'%':'–'}</div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-top:2px">from entry</div>
           </div>
           <div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:3px">DISTANCE</div>
-            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:\${isNear?'var(--red)':isHit?'var(--red)':'var(--text)'}">\${stopD!=null?stopD.toFixed(1)+'%':'–'}</div>
+            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:${isNear?'var(--red)':isHit?'var(--red)':'var(--text)'}">${stopD!=null?stopD.toFixed(1)+'%':'–'}</div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-top:2px">current → stop</div>
           </div>
         </div>
-        \${atr?\`<div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:7px;padding-top:7px;border-top:1px solid var(--border)">ATR(14): ₹\${f2(atr)}\${pos._atrManual?' · ✏ Manual set':' · ⟳ Auto from live data'}</div>\`:''}
+        ${atr?`<div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:7px;padding-top:7px;border-top:1px solid var(--border)">ATR(14): ₹${f2(atr)}${pos._atrManual?' · ✏ Manual set':' · ⟳ Auto from live data'}</div>`:''}
       </div>
 
       <!-- Section B: 50DMA Position -->
@@ -1455,74 +1515,74 @@ function renderPositions(){
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
           <div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:3px">50DMA</div>
-            <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--teal)">\${sma50?'₹'+sma50.toLocaleString('en-IN',{maximumFractionDigits:0}):'–'}</div>
-            <div style="font-size:10px;font-family:var(--mono);margin-top:2px;color:\${above50!=null?(above50>=0?'var(--green)':'var(--amber)'):'var(--text3)'}">\${above50!=null?(above50>=0?'+':'')+above50.toFixed(1)+'%':'–'}</div>
+            <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--teal)">${sma50?'₹'+sma50.toLocaleString('en-IN',{maximumFractionDigits:0}):'–'}</div>
+            <div style="font-size:10px;font-family:var(--mono);margin-top:2px;color:${above50!=null?(above50>=0?'var(--green)':'var(--amber)'):'var(--text3)'}">${above50!=null?(above50>=0?'+':'')+above50.toFixed(1)+'%':'–'}</div>
           </div>
           <div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:3px">200DMA</div>
-            <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--blue)">\${pos.sma200?'₹'+pos.sma200.toLocaleString('en-IN',{maximumFractionDigits:0}):'–'}</div>
-            <div style="font-size:10px;font-family:var(--mono);margin-top:2px;color:\${above200!=null?(above200>=0?'var(--green)':'var(--red)'):'var(--text3)'}">\${above200!=null?(above200>=0?'+':'')+above200.toFixed(1)+'%':'–'}</div>
+            <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:var(--blue)">${pos.sma200?'₹'+pos.sma200.toLocaleString('en-IN',{maximumFractionDigits:0}):'–'}</div>
+            <div style="font-size:10px;font-family:var(--mono);margin-top:2px;color:${above200!=null?(above200>=0?'var(--green)':'var(--red)'):'var(--text3)'}">${above200!=null?(above200>=0?'+':'')+above200.toFixed(1)+'%':'–'}</div>
           </div>
           <div>
             <div style="font-size:9px;color:var(--text3);font-family:var(--mono);margin-bottom:3px">RSI (14)</div>
-            <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:\${rsiV>75?'var(--red)':rsiV<40?'var(--amber)':'var(--green)'}">\${rsiV?rsiV.toFixed(1):'–'}</div>
-            <div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:2px">\${rsiV?(rsiV>75?'Overbought':rsiV<40?'Oversold':'Healthy'):''}</div>
+            <div style="font-size:14px;font-weight:700;font-family:var(--mono);color:${rsiV>75?'var(--red)':rsiV<40?'var(--amber)':'var(--green)'}">${rsiV?rsiV.toFixed(1):'–'}</div>
+            <div style="font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:2px">${rsiV?(rsiV>75?'Overbought':rsiV<40?'Oversold':'Healthy'):''}</div>
           </div>
         </div>
       </div>
 
       <!-- Section C: Profit Booking Targets -->
       <div style="background:var(--bg);border-radius:9px;padding:10px 12px;margin-bottom:8px">
-        <div style="font-size:9px;font-weight:700;color:var(--text3);font-family:var(--mono);letter-spacing:.8px;margin-bottom:8px">🎯 PROFIT TARGETS \${!risk?'<span style="font-size:9px;color:var(--amber)">(Set ATR to calculate)</span>':''}</div>
-        \${risk ? \`
+        <div style="font-size:9px;font-weight:700;color:var(--text3);font-family:var(--mono);letter-spacing:.8px;margin-bottom:8px">🎯 PROFIT TARGETS ${!risk?'<span style="font-size:9px;color:var(--amber)">(Set ATR to calculate)</span>':''}</div>
+        ${risk ? `
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
           <div style="background:var(--purple-dim);border-radius:8px;padding:9px">
             <div style="font-size:9px;color:var(--purple);font-family:var(--mono);margin-bottom:3px">⚡ BREAKEVEN (1.5R)</div>
-            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--purple)">₹\${r15?f2(r15):'–'}</div>
+            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--purple)">₹${r15?f2(r15):'–'}</div>
             <div style="font-size:10px;color:var(--purple);font-family:var(--mono);margin-top:2px">Move stop → entry</div>
           </div>
           <div style="background:var(--blue-dim);border-radius:8px;padding:9px">
-            <div style="font-size:9px;color:var(--blue);font-family:var(--mono);margin-bottom:3px">🎯 TARGET 1 (2R) · \${t1Action}</div>
-            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--blue)">₹\${r2?f2(r2):'–'}</div>
-            <div style="font-size:10px;color:var(--blue);font-family:var(--mono);margin-top:2px">\${r2P?'+'+r2P.toFixed(2)+'%':''} · \${r2PnL?inr(r2PnL):''}</div>
+            <div style="font-size:9px;color:var(--blue);font-family:var(--mono);margin-bottom:3px">🎯 TARGET 1 (2R) · ${t1Action}</div>
+            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--blue)">₹${r2?f2(r2):'–'}</div>
+            <div style="font-size:10px;color:var(--blue);font-family:var(--mono);margin-top:2px">${r2P?'+'+r2P.toFixed(2)+'%':''} · ${r2PnL?inr(r2PnL):''}</div>
           </div>
-          \${type!=='sme'?\`
+          ${type!=='sme'?`
           <div style="background:var(--teal-dim);border-radius:8px;padding:9px">
-            <div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-bottom:3px">🏆 TARGET 2 (3R) · \${t2Action}</div>
-            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--teal)">₹\${r3?f2(r3):'–'}</div>
-            <div style="font-size:10px;color:var(--teal);font-family:var(--mono);margin-top:2px">\${r3P?'+'+r3P.toFixed(2)+'%':''} · \${r3PnL?inr(r3PnL):''}</div>
-          </div>\`:\`
+            <div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-bottom:3px">🏆 TARGET 2 (3R) · ${t2Action}</div>
+            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--teal)">₹${r3?f2(r3):'–'}</div>
+            <div style="font-size:10px;color:var(--teal);font-family:var(--mono);margin-top:2px">${r3P?'+'+r3P.toFixed(2)+'%':''} · ${r3PnL?inr(r3PnL):''}</div>
+          </div>`:`
           <div style="background:var(--teal-dim);border-radius:8px;padding:9px">
             <div style="font-size:9px;color:var(--teal);font-family:var(--mono);margin-bottom:3px">🏆 TARGET 2 (3R) · TIGHTEN STOP</div>
-            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--teal)">₹\${r3?f2(r3):'–'}</div>
+            <div style="font-size:15px;font-weight:700;font-family:var(--mono);color:var(--teal)">₹${r3?f2(r3):'–'}</div>
             <div style="font-size:10px;color:var(--teal);font-family:var(--mono);margin-top:2px">SME: trail stop only</div>
-          </div>\`}
-        </div>\` : \`
+          </div>`}
+        </div>` : `
         <div style="font-size:11px;color:var(--text3);text-align:center;padding:10px 0">
           Tap <strong style="color:var(--gold)">⟳ Prices</strong> to auto-calculate ATR and targets from live market data
-        </div>\`}
+        </div>`}
       </div>
 
       <!-- Progress bar stop → T1 -->
-      \${r2&&stop?\`
+      ${r2&&stop?`
       <div class="progrow">
         <div class="proghd">
           <span class="progtxt">Stop → T1 Progress</span>
-          <span class="progtxt" style="color:\${progCol}">\${prog.toFixed(0)}%\${prog>=100?' ✅':''}</span>
+          <span class="progtxt" style="color:${progCol}">${prog.toFixed(0)}%${prog>=100?' ✅':''}</span>
         </div>
-        <div class="progbg"><div class="progfill" style="width:\${prog}%;background:\${progCol}"></div></div>
-      </div>\`:''}
+        <div class="progbg"><div class="progfill" style="width:${prog}%;background:${progCol}"></div></div>
+      </div>`:''}
 
       <!-- FOOTER -->
       <div class="pfooter">
-        <div style="font-size:10px;color:var(--text3)">Invested: \${inr(inv)}</div>
+        <div style="font-size:10px;color:var(--text3)">Invested: ${inr(inv)}</div>
         <div class="btnrow">
-          <button class="bsm b-edit" onclick="openEdit(\${i})">Edit</button>
-          <button class="bsm b-book" onclick="openClose(\${i})">Close</button>
-          <button class="bsm b-exit" onclick="removePos(\${i})">Delete</button>
+          <button class="bsm b-edit" onclick="openEdit(${i})">Edit</button>
+          <button class="bsm b-book" onclick="openClose(${i})">Close</button>
+          <button class="bsm b-exit" onclick="removePos(${i})">Delete</button>
         </div>
       </div>
-    </div>\`;
+    </div>`;
   }).join('');
 }
 
@@ -1826,14 +1886,14 @@ document.addEventListener('DOMContentLoaded',()=>{
   load();tick();setInterval(tick,1000);
   updateDashboard();renderPortfolio();renderAlerts();
   if(!D.watchlist) D.watchlist=[];
-  fetchMarket();startRefresh();
+  fetchMarket().catch(()=>{}); startRefresh();
   // Also refresh radar if it has stocks and market is open
   setTimeout(()=>{ if(D.watchlist&&D.watchlist.length>0&&mktStatus()==='open') refreshAllRadar(); }, 4000);
 });
 document.addEventListener('visibilitychange',()=>{
   if(!document.hidden){
     const stale=!D.lastFetch||(Date.now()-new Date(D.lastFetch).getTime())>5*60*1000;
-    if(stale&&mktStatus()==='open'){fetchMarket();fetchAllPrices();}
+    if(stale&&mktStatus()==='open'){fetchMarket().catch(()=>{});fetchAllPrices().catch(()=>{});}
   }
 });
 
@@ -2126,31 +2186,6 @@ function noteBreakeven(idx){
 }
 
 
-<!-- ADD TO RADAR SHEET -->
-<div id="sheet-radar-add" class="sheet-ov" onclick="closeOv(event)">
-<div class="sheet">
-  <div class="shandle"></div>
-  <div class="stitle">Add to Radar</div>
-  <div class="blk blk-amb" style="margin-bottom:14px">
-    <div class="blk-txt">Enter NSE ticker. The app fetches live price, RSI, 200DMA and generates an entry verdict automatically using v3.2 rules.</div>
-  </div>
-  <div class="fg"><label class="fl">NSE TICKER</label><input type="text" id="ra-ticker" class="fi" placeholder="e.g. HDFCBANK, HAL, ZOMATO" autocapitalize="characters"></div>
-  <div class="fg"><label class="fl">SECTOR</label><select id="ra-sector" class="fs">
-    <option value="Financials">Financials</option>
-    <option value="Technology">Technology</option>
-    <option value="Consumer">Consumer</option>
-    <option value="Industrials">Industrials</option>
-    <option value="Healthcare">Healthcare</option>
-    <option value="Infrastructure">Infrastructure</option>
-    <option value="Energy">Energy</option>
-    <option value="Telecom">Telecom</option>
-  </select></div>
-  <div class="fg"><label class="fl">YOUR NOTES (optional)</label><input type="text" id="ra-notes" class="fi" placeholder="e.g. watching for pullback to 50DMA"></div>
-  <button class="btn-p" onclick="addToRadar()">Add &amp; Analyse</button>
-  <button class="btn-s" onclick="closeSheet('sheet-radar-add')">Cancel</button>
-</div>
-</div>
-
 
 // ════════════════════════════════════════════════════════════════
 // RADAR ENGINE — Watchlist & Entry Verdict System
@@ -2275,7 +2310,7 @@ async function fetchRadarStock(idx) {
     let volData = null;
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${w.ticker}.NS?interval=1d&range=3mo`;
-      const raw = await fetch('https://corsproxy.io/?url=' + encodeURIComponent(url), {signal: AbortSignal.timeout(9000)});
+      const raw = await fetch(PROXIES[1](url), {signal: (()=>{const c=new AbortController();setTimeout(()=>c.abort(),9000);return c.signal;})()});
       const j = await raw.json();
       const ch = j.chart?.result?.[0];
       if (ch) {
