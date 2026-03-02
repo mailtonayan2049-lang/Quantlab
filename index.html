@@ -518,7 +518,7 @@ nav{position:fixed;bottom:0;left:0;right:0;height:var(--nav-h);background:var(--
     <div class="cphead"><span style="font-size:12px;font-weight:600">Regime Conditions</span><span id="cpcnt" class="mval" style="font-size:18px;color:var(--text2)">–/5</span></div>
     <div class="cpbar"><div id="cpfill" class="cpfill" style="width:0%;background:var(--text3)"></div></div>
   </div>
-  <div class="sh"><span class="st">REGIME FILTER</span><button class="reb" onclick="fetchMarket()">⟳ Refresh</button></div>
+  <div class="sh"><span class="st">REGIME FILTER</span><button class="reb" onclick="fetchMarket(true)">⟳ Refresh</button></div>
   <div id="conds-grid" class="conds"></div>
   <div class="sh"><span class="st">RULE ALERTS</span><button class="sa" onclick="clearAlerts()">Clear</button></div>
   <div id="alert-feed" class="alerts">
@@ -1118,9 +1118,13 @@ function atr14(highs,lows,closes){
   return trs.slice(-14).reduce((a,b)=>a+b,0)/14;
 }
 
-async function fetchMarket(){
+async function fetchMarket(forceRefresh=false){
   setReb('⟳ Loading...');
   updateCondCards('loading');
+  // Clear Nifty/VIX cache on manual refresh so we get truly fresh data
+  if(forceRefresh){
+    try{localStorage.removeItem('yfc_^NSEI_6mo');localStorage.removeItem('yfc_^INDIAVIX_6mo');}catch(e){}
+  }
   // Fail fast if no connectivity — 12 second hard timeout
   const fetchTimeout = setTimeout(()=>{
     setReb('⟳ Retry');
@@ -1150,14 +1154,27 @@ async function fetchMarket(){
   }catch(e){clearTimeout(fetchTimeout);setReb('⟳ Retry');updateDashboard();addAlert({type:'warning',title:'⚠ Market Data Failed',body:'Live data unavailable — showing last saved regime. Tap Refresh to retry.'});renderAlerts();}
 }
 
-async function fetchAllPrices(){
+async function fetchAllPrices(forceRefresh=true){
   if(D.positions.length===0){addAlert({type:'info',title:'No Positions',body:'Add positions first.'});renderAlerts();return;}
   const btn=document.querySelector('.reb[onclick="fetchAllPrices()"]');
   if(btn)btn.textContent='⟳ Fetching...';
+  // Clear cache for all positions when user manually refreshes
+  if(forceRefresh){
+    D.positions.forEach(pos=>{
+      try{localStorage.removeItem('yfc_'+pos.ticker+'.NS_ohlc_6mo');}catch(e){}
+    });
+  }
   let ok=0;
   await Promise.allSettled(D.positions.map(async(pos,i)=>{
     try{
-      const{closes,highs,lows,vols}=await yfOHLC(pos.ticker+'.NS','6mo');
+      // Try .NS first, then .BO (BSE) as fallback for SME stocks
+      let ohlcData;
+      try{ ohlcData=await yfOHLC(pos.ticker+'.NS','6mo'); }
+      catch(e1){
+        try{ ohlcData=await yfOHLC(pos.ticker+'.BO','6mo'); }
+        catch(e2){ throw e1; }
+      }
+      const{closes,highs,lows,vols}=ohlcData;
       if(!closes||closes.length===0)return;
       const calcAtr=atr14(highs,lows,closes);
       D.positions[i].price   = closes[closes.length-1];
@@ -1177,12 +1194,16 @@ async function fetchAllPrices(){
         D.positions[i].stop = parseFloat((D.positions[i].price - calcAtr*mult).toFixed(2));
       }
       ok++;
-    }catch(e){}
+    }catch(e){
+      D.positions[i]._fetchErr = e.message||'failed';
+    }
   }));
   document.getElementById('last-upd').textContent='Updated '+ist().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})+' IST';
   if(btn)btn.textContent='⟳ Prices';
+  const failed=D.positions.filter(p=>p._fetchErr).map(p=>p.ticker);
   updatePeak();checkPosAlerts();save();renderPortfolio();
-  addAlert({type:'success',title:`✅ Prices Updated (${ok}/${D.positions.length})`,body:`Live data fetched. P&L and alerts updated.`});
+  const failMsg = failed.length ? ` | Failed: ${failed.join(', ')}` : '';
+  addAlert({type: ok>0?'success':'warning', title:`${ok>0?'✅':'⚠'} Prices Updated (${ok}/${D.positions.length})`, body:`Live NSE data fetched. ATR auto-calculated.${failMsg}`});
   renderAlerts();
 }
 
